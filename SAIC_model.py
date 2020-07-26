@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 
-#TODO:交互模块
+#交互模块Pooling module(proposed in social gan)
 class PoolHiddenNet(nn.Module):
-    """Pooling module as proposed in social gan"""
     def __init__(self, embedding_dim=64, h_dim=64):
         super(PoolHiddenNet, self).__init__()
         self.h_dim = h_dim
@@ -25,7 +24,8 @@ class PoolHiddenNet(nn.Module):
         tensor = tensor.view(-1, col_len)
         return tensor
 
-    def forward(self,hist_enc,hist_pos_batch,seq_start_end):#需要添加seq_start_end,周围车辆的hist_enc以及hist_pos
+    # 需要添加seq_start_end,周围车辆的hist_enc以及hist_pos
+    def forward(self,hist_enc,hist_pos_batch,seq_start_end):
         pool_h = []
         for i in range(len(seq_start_end)-1):
             start = seq_start_end[i]
@@ -48,6 +48,7 @@ class PoolHiddenNet(nn.Module):
         pool_h = torch.cat(pool_h, dim=0)
         return pool_h
 
+#定义预测框架SAICNet
 class SAICNet(nn.Module):
 
     ## Initialization
@@ -56,11 +57,11 @@ class SAICNet(nn.Module):
         self.args = args
         self.use_cuda = args['use_cuda']#True
         # Flag for maneuver based (True) vs uni-modal decoder (False)
-        self.use_maneuvers = args['use_maneuvers']#True
+        self.use_maneuvers = args['use_maneuvers']#False
 
         ## Define size
-        self.in_length=args['in_length']
-        self.out_length=args['out_length']
+        self.in_length=args['in_length']#20
+        self.out_length=args['out_length']#50
 
         ## Sizes of network layers
         self.encoder_size = args['encoder_size']#64
@@ -70,12 +71,15 @@ class SAICNet(nn.Module):
         self.num_lon_classes = args['num_lon_classes']#3
 
         ## consider interaction or not
-        self.interaction = args['interaction']#default false
+        self.social_input = args["social_input"]#False
+        self.interaction = args['interaction']#False
 
         ## Define network weights
-
         # Input embedding layer
-        self.ip_emb = torch.nn.Linear(2,self.input_embedding_size)
+        if self.social_input:
+            self.ip_emb = torch.nn.Linear(5, self.input_embedding_size)
+        else:
+            self.ip_emb = torch.nn.Linear(2,self.input_embedding_size)
         # Encoder LSTM
         self.enc_lstm = torch.nn.LSTM(self.input_embedding_size,self.encoder_size,1)
 
@@ -84,12 +88,17 @@ class SAICNet(nn.Module):
             self.pool=PoolHiddenNet(embedding_dim=self.pool_embedding_size,h_dim=self.encoder_size)
 
         # Decoder LSTM
+        if self.interaction:
+            self.dec_hidden=self.encoder_size*2
+        else:
+            self.dec_hidden=self.encoder_size
+
         if self.use_maneuvers:
-            self.dec_lstm=torch.nn.LSTM(self.encoder_size+self.num_lon_classes,self.decoder_size,1)
-            self.op_lon = torch.nn.Linear(self.encoder_size,self.num_lon_classes)
+            self.dec_lstm=torch.nn.LSTM(self.dec_hidden+self.num_lon_classes,self.decoder_size,1)
+            self.op_lon = torch.nn.Linear(self.dec_hidden,self.num_lon_classes)
             self.softmax = torch.nn.Softmax(dim=1)
         else:
-            self.dec_lstm=torch.nn.LSTM(self.encoder_size,self.decoder_size,1)
+            self.dec_lstm=torch.nn.LSTM(self.dec_hidden,self.decoder_size,1)
 
         # Output layers:
         self.op = torch.nn.Linear(self.decoder_size,2)
@@ -101,28 +110,30 @@ class SAICNet(nn.Module):
     ## Forward Pass
     def forward(self,hist,hist_pos=None,seq_start_end=None):
         if self.interaction:
-            pass#TODO
             # 注意lstm的输入要求是(seq,batch,2)
             _, (hist_enc, _) = self.enc_lstm(self.relu(self.ip_emb(hist)))#注意这里的历史编码不再只包含自车，还包括周围车辆。
+            hist_enc = hist_enc.view(hist_enc.shape[1], hist_enc.shape[2])
             soc_enc=self.pool(hist_enc,hist_pos,seq_start_end)
+            enc = torch.cat((soc_enc, hist_enc[seq_start_end[0:-1], :]), 1)
             if self.use_maneuvers:
-                lon_pred = self.softmax(self.op_lon(soc_enc))
+                lon_pred = self.softmax(self.op_lon(enc))
                 fut_pred=[]
                 for k in range(self.num_lon_classes):
-                    lon_enc_tmp = torch.zeros(soc_enc.shape[0],self.num_lon_classes)
+                    lon_enc_tmp = torch.zeros(enc.shape[0],self.num_lon_classes)
                     if self.use_cuda:
                         lon_enc_tmp=lon_enc_tmp.cuda()
                     lon_enc_tmp[:, k] = 1
-                    enc_tmp = torch.cat((soc_enc, lon_enc_tmp), 1)
+                    enc_tmp = torch.cat((enc, lon_enc_tmp), 1)
                     fut_pred.append(self.decode(enc_tmp))
                 return fut_pred,lon_pred
-            fut_pred = self.decode(soc_enc)
+            fut_pred = self.decode(enc)
             return fut_pred
         else:
-            ## Forward pass hist:
             #注意lstm的输入要求是(seq,batch,2)
             _,(hist_enc,_) = self.enc_lstm(self.relu(self.ip_emb(hist)))
-            #hist_enc的尺寸为（1,batch,64）
+            hist_enc = hist_enc.view(hist_enc.shape[1], hist_enc.shape[2])
+            if seq_start_end is not None:
+                hist_enc=hist_enc[seq_start_end[0:-1], :]
             if self.use_maneuvers:
                 lon_pred = self.softmax(self.op_lon(hist_enc))
                 fut_pred = []
@@ -145,6 +156,7 @@ class SAICNet(nn.Module):
         fut_pred = fut_pred.permute(1, 0, 2)
         return fut_pred
 
+#网络参数的初始化。
 def init_weights(m):
     classname=m.__class__.__name__
     if classname.find("Linear")!=-1:
